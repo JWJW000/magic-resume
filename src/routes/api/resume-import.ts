@@ -1,5 +1,22 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { formatGeminiErrorMessage, getGeminiModelInstance } from "@/lib/server/gemini";
+import { AIModelType, AI_MODEL_CONFIGS } from "@/config/ai";
+
+const parseUpstreamError = (raw: string, fallback: string) => {
+  if (!raw) return { message: fallback };
+  try {
+    const data = JSON.parse(raw) as {
+      error?: { message?: string; code?: string };
+      message?: string;
+    };
+    return {
+      message: data.error?.message || data.message || fallback,
+      code: data.error?.code
+    };
+  } catch {
+    return { message: raw };
+  }
+};
 
 const parseJsonPayload = (content: string) => {
   const text = content.trim();
@@ -45,12 +62,14 @@ export const Route = createFileRoute("/api/resume-import")({
       POST: async ({ request }) => {
         try {
           const body = await request.json();
-          const { apiKey, model, content, images, locale } = body as {
+          const { apiKey, model, content, images, locale, modelType, apiEndpoint } = body as {
             apiKey: string;
             model?: string;
             content?: string;
             images?: string[];
             locale?: string;
+            modelType?: AIModelType;
+            apiEndpoint?: string;
           };
 
           if (!apiKey || (!content && (!images || images.length === 0))) {
@@ -61,22 +80,8 @@ export const Route = createFileRoute("/api/resume-import")({
           }
 
           const language = locale === "en" ? "English" : "Chinese";
-          const geminiModel = model || "gemini-flash-latest";
-          const imageParts = Array.isArray(images)
-            ? images.map((image) => {
-                const payload = extractBase64Payload(image);
-                return {
-                  inlineData: {
-                    mimeType: payload.mimeType,
-                    data: payload.data,
-                  },
-                };
-              })
-            : [];
-          const modelInstance = getGeminiModelInstance({
-            apiKey,
-            model: geminiModel,
-            systemInstruction: `你是一个专业的简历结构化助手。根据用户提供的简历内容，提取信息并只输出一个合法 JSON 对象。
+
+          const systemInstruction = `你是一个专业的简历结构化助手。根据用户提供的简历内容，提取信息并只输出一个合法 JSON 对象。
 
 输出约束：
 1. 只允许输出 JSON，不要输出 Markdown，不要输出解释。
@@ -126,24 +131,102 @@ JSON 结构：
     }
   ],
   "skills": ["", ""]
-}`,
-            generationConfig: {
-              temperature: 0.2,
-              responseMimeType: "application/json",
-            },
-          });
+}`;
 
-          const inputParts = [
-            {
-              text:
-                content ||
-                "请识别以下简历页面图片中的信息，并严格按 JSON 结构输出。",
-            },
-            ...imageParts,
-          ];
+          let aiContent = "";
 
-          const result = await modelInstance.generateContent(inputParts);
-          const aiContent = result.response.text();
+          if (modelType === "gemini" || !modelType) {
+            const geminiModel = model || "gemini-flash-latest";
+            const imageParts = Array.isArray(images)
+              ? images.map((image) => {
+                  const payload = extractBase64Payload(image);
+                  return {
+                    inlineData: {
+                      mimeType: payload.mimeType,
+                      data: payload.data,
+                    },
+                  };
+                })
+              : [];
+            const modelInstance = getGeminiModelInstance({
+              apiKey,
+              model: geminiModel,
+              systemInstruction,
+              generationConfig: {
+                temperature: 0.2,
+                responseMimeType: "application/json",
+              },
+            });
+
+            const inputParts = [
+              {
+                text:
+                  content ||
+                  "请识别以下简历页面图片中的信息，并严格按 JSON 结构输出。",
+              },
+              ...imageParts,
+            ];
+
+            const result = await modelInstance.generateContent(inputParts);
+            aiContent = result.response.text();
+          } else {
+            const modelConfig = AI_MODEL_CONFIGS[modelType];
+            if (!modelConfig) {
+              return Response.json({ error: "Invalid model type" }, { status: 400 });
+            }
+
+            const messageContent: any[] = [];
+            if (content) {
+              messageContent.push({ type: "text", text: content });
+            } else {
+              messageContent.push({ type: "text", text: "请识别以下简历页面图片中的信息，并严格按 JSON 结构输出。" });
+            }
+
+            if (Array.isArray(images)) {
+              images.forEach((image) => {
+                const payload = extractBase64Payload(image);
+                messageContent.push({
+                  type: "image_url",
+                  image_url: {
+                    url: `data:${payload.mimeType};base64,${payload.data}`
+                  }
+                });
+              });
+            }
+
+            const response = await fetch(modelConfig.url(apiEndpoint), {
+              method: "POST",
+              headers: modelConfig.headers(apiKey),
+              body: JSON.stringify({
+                model: modelConfig.requiresModelId ? model : modelConfig.defaultModel,
+                response_format: { type: "json_object" },
+                temperature: 0.2,
+                messages: [
+                  {
+                    role: "system",
+                    content: systemInstruction
+                  },
+                  {
+                    role: "user",
+                    content: messageContent
+                  }
+                ]
+              })
+            });
+
+            if (!response.ok) {
+              const fallbackMessage = `Upstream API error: ${response.status} ${response.statusText}`;
+              const rawError = await response.text();
+              const parsedError = parseUpstreamError(rawError, fallbackMessage);
+              return Response.json(
+                { error: parsedError.message },
+                { status: response.status }
+              );
+            }
+
+            const data = await response.json();
+            aiContent = data.choices?.[0]?.message?.content || "";
+          }
 
           if (!aiContent || typeof aiContent !== "string") {
             return Response.json(

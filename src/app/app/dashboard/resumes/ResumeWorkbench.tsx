@@ -43,10 +43,7 @@ export const ResumeWorkbench = () => {
         deleteResume,
         createResume,
     } = useResumeStore();
-    const {
-        geminiApiKey,
-        geminiModelId,
-    } = useAIConfigStore();
+    const aiConfig = useAIConfigStore();
     const router = useRouter();
     const [hasConfiguredFolder, setHasConfiguredFolder] = useState(false);
     const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -186,8 +183,8 @@ export const ResumeWorkbench = () => {
     };
 
     const importResumeFromPdf = async (file: File) => {
-        if (!geminiApiKey || !geminiModelId) {
-            toast.error(t("dashboard.resumes.importDialog.geminiConfigRequired"));
+        if (!aiConfig.isConfigured()) {
+            toast.error(t("dashboard.resumes.importDialog.configRequired"));
             router.push("/app/dashboard/ai");
             return;
         }
@@ -197,6 +194,25 @@ export const ResumeWorkbench = () => {
             throw new Error("No extractable PDF pages");
         }
 
+        const { AI_MODEL_CONFIGS } = await import("@/config/ai");
+        const config = AI_MODEL_CONFIGS[aiConfig.selectedModel];
+        const apiKey =
+            aiConfig.selectedModel === "doubao"
+                ? aiConfig.doubaoApiKey
+                : aiConfig.selectedModel === "openai"
+                ? aiConfig.openaiApiKey
+                : aiConfig.selectedModel === "gemini"
+                ? aiConfig.geminiApiKey
+                : aiConfig.deepseekApiKey;
+        const modelId =
+            aiConfig.selectedModel === "doubao"
+                ? aiConfig.doubaoModelId
+                : aiConfig.selectedModel === "openai"
+                ? aiConfig.openaiModelId
+                : aiConfig.selectedModel === "gemini"
+                ? aiConfig.geminiModelId
+                : aiConfig.deepseekModelId;
+
         const response = await fetch("/api/resume-import", {
             method: "POST",
             headers: {
@@ -204,8 +220,10 @@ export const ResumeWorkbench = () => {
             },
             body: JSON.stringify({
                 images: pdfImages,
-                apiKey: geminiApiKey,
-                model: geminiModelId,
+                apiKey,
+                model: config.requiresModelId ? modelId : config.defaultModel,
+                modelType: aiConfig.selectedModel,
+                apiEndpoint: aiConfig.selectedModel === "openai" ? aiConfig.openaiApiEndpoint : undefined,
                 locale,
             }),
         });
